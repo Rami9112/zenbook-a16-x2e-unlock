@@ -1,0 +1,11 @@
+# Local runtime backups and transcript logs
+backups/*.json
+logs/*.txt
+apply_result.txt
+restore_result.txt
+backup_before_tuning.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+.venv/
