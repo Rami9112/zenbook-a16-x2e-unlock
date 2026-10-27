@@ -1,100 +1,106 @@
 # ASUS Zenbook A16 (`UX3607OA`) — Snapdragon X2 Elite Extreme (`X2E-94-100`) Kernel Memory & Bus Unlock
 
 > [!IMPORTANT]
-> **하드웨어 전용 안내 (Strictly Hardware-Specific)**
-> 이 저장소의 모든 분석과 튜닝 스크립트는 오직 **ASUS Zenbook A16 (`UX3607OA`) / Qualcomm Snapdragon X2 Elite Extreme (`X2E-94-100` / `SC8480XP`, 48GB LPDDR5x 통합 메모리)** 단일 기종 및 해당 드라이버(`qcdxkm8480.sys`, `qcnspmcdm8480.sys`, `qcpep8480.sys`)에 한해서만 검증되었습니다.
-> 스크립트 내부에 하드웨어 모델 검증 가드가 포함되어 있어 다른 노트북에서는 실행이 자동 차단됩니다.
+> **Strictly Hardware-Specific (ASUS Zenbook A16 `UX3607OA` Only)**
+> Every kernel registry override, byte offset, and benchmark in this repository was reverse-engineered and verified **exclusively** on the **ASUS Zenbook A16 (`UX3607OA`)** equipped with the **Qualcomm Snapdragon X2 Elite Extreme (`X2E-94-100` / `SC8480XP`, 48 GB LPDDR5x Unified Memory)** and its corresponding Windows ARM64 kernel drivers (`qcdxkm8480.sys`, `qcnspmcdm8480.sys`, `qcpep8480.sys`).
+> The tuning script enforces a strict hardware model guard (`UX3607OA` & `X2E94100`) and will automatically abort on any other machine unless `-Force` is explicitly passed.
 
 ---
 
-## 1. 개요: 왜 이 튜닝이 필요한가? (`gpu-unlock`과의 구조적 비교)
+## 1. Overview: Architectural Comparison with `Zagitta/gpu-unlock`
 
-NVIDIA RTX 30(Ampere) 시리즈의 펌웨어 언락([`Zagitta/gpu-unlock`](https://github.com/Zagitta/gpu-unlock))과 스냅드래곤 X2 Elite Extreme(`X2E-94-100`) 48GB 통합 메모리 노트북은 **정반대 방향의 족쇄**를 차고 있습니다.
+While [`Zagitta/gpu-unlock`](https://github.com/Zagitta/gpu-unlock) removes an artificial **compute throughput (instruction issue-rate) lock** on discrete NVIDIA Ampere GPUs, the Snapdragon X2 Elite Extreme (`X2E-94-100`) 48 GB Unified Memory platform suffers from the exact opposite bottleneck: **artificial memory capacity and bus-scaling locks** imposed by Windows WDDM and Qualcomm kernel driver defaults.
 
-| 비교 항목 | NVIDIA Ampere (`Zagitta/gpu-unlock`) | **ASUS Zenbook A16 (`X2E-94-100`, 48GB RAM)** |
+| Dimension | NVIDIA Ampere (`Zagitta/gpu-unlock`) | **ASUS Zenbook A16 (`X2E-94-100`, 48 GB Unified RAM)** |
 | :--- | :--- | :--- |
-| **하드웨어 아키텍처** | 전용 24GB VRAM을 가진 외장 GPU | CPU(18코어) · GPU(Adreno X2-90) · NPU(Hexagon V81)가 **48GB LPDDR5x(228GB/s)를 공유**하는 통합 SoC |
-| **걸려 있는 제한** | **연산 속도(Compute) 락**: 퓨즈 레지스터(`SS0`/`SS1`)로 FP16/BF16 명령어 처리량을 50%로 제한 | **메모리 용량(Capacity) & 버스 스케일링 락**: 연산기는 100% 풀스펙이지만 OS/드라이버가 **NPU 16GB / GPU 23.8GB**로 메모리 할당 상한을 제한 |
-| **언락 메커니즘** | SEC2 Booter 버퍼 오버플로우 + ROP 익스플로잇 + PCIe FLR | 드라이버 서명 훼손 없이 커널 드라이버(`qcnspmcdm8480.sys`, `qcdxkm8480.sys`, `qcpep8480.sys`)의 **레지스트리 구성 테이블 오버라이드** |
-| **핵심 효과** | 동일 크기 모델을 2배 빠르게 연산 (Compute-bound 돌파) | **30B~70B급 초대형 AI 모델 및 고사양 작업을 NPU/GPU에 통째로 적재** (Memory-bound 돌파) |
+| **Hardware Architecture** | Discrete GPU with fixed 24 GB dedicated VRAM | Unified SoC where 18-core Oryon Gen3 CPU, Adreno X2-90 GPU (`Adreno 880`), and Hexagon NPU V81 (80 TOPS) share **48 GB LPDDR5x (228 GB/s)** |
+| **The Artificial Lock** | **Compute Lock**: Fuse registers (`SS0`/`SS1`) halve FP16/BF16 FMA instruction throughput to 50% | **Memory Capacity & Scaling Lock**: Compute units run at 100% full spec, but driver/OS limits cap allocations at **16 GB for NPU** and **23.81 GB (50%) for GPU** |
+| **Unlock Mechanism** | SEC2 Booter stack buffer overflow + ROP exploit + PCIe Function Level Reset | Signed-driver-safe **kernel registry table overrides** parsed during `DriverEntry` / `DxgkDdiAddDevice` (`qcnspmcdm8480.sys`, `qcdxkm8480.sys`, `qcpep8480.sys`) |
+| **Primary Benefit** | Executes the same model 2x faster (breaks **Compute-bound** ceiling) | **Loads 30B–70B+ LLMs and massive workloads directly into NPU/GPU memory** without CPU fallback or TDR resets (breaks **Memory-bound** ceiling) |
 
 ---
 
-## 2. 단계별 커널 튜닝 내역
+## 2. What the 3-Stage Kernel Unlock Does
 
-### Stage 1: NPU 32GB SMMU 언락 + GPU 35.7GB 확장 + TDR 연장 (무결성 100%)
-1. **Hexagon NPU V81 SMMU 32GB 매핑 언락 (`qcnspmcdm8480.sys`)**
-   * 경로: `HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\VEN_QCOM&DEV_0FF0...\Device Parameters\NSPM\SMMU`
-   * 값: `FastRPCSIDAllocation` (`REG_BINARY`)
-   * `qcnspmcdm8480.sys` 역어셈블리(`0x14003ee30`) 결과, 오프셋 `[12..15]`, `[20..23]`, `[28..31]`을 **Big-Endian 32-bit MB(`bfi` 조립 후 `lsl #20`)**로 파싱함을 확인.
-   * 기존 `00 00 40 00` (`0x00004000` MB = **16GB**) → `00 00 80 00` (`0x00008000` MB = **32GB**)로 확장.
-2. **Adreno X2-90 (`Adreno 880`) 공유 메모리 커밋 한도 확장 (`qcdxkm8480.sys`)**
-   * 경로: `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager`
-   * 값: `SystemPartitionCommitLimitPercentage = 75` (`REG_DWORD`)
-   * `qcdxkm8480.sys` 역어셈블리(`0x140631b4c`) 결과, `SystemMemoryCommitLimit`은 32-bit 시프트(`lsl w26, w8, #20`) 버그로 4GB 이상에서 오버플로우가 나는 반면, `SystemPartitionCommitLimitPercentage`는 **64-bit 연산(`(TotalRAM - 512MB) / 100 * Pct`)**으로 내부 커밋 한도(`[x19, #0x588]`)를 설정함을 확인.
-   * WDDM GPU 공유 메모리를 기본 50%(`23.81 GB`) → **75%(`35.71 GB`)**로 확장.
-3. **GPU TDR 타임아웃 연장 (`dxgkrnl.sys`)**
-   * 경로: `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`
-   * 값: `TdrDelay = 15`, `TdrDdiDelay = 15` (기본 2초 → **15초**)
-   * 대형 LLM 프롬프트 처리(Prefill) 및 고부하 컴퓨트 셰이더 실행 중 드라이버 강제 리셋 방지.
+### Stage 1: NPU 32 GB SMMU Unlock + GPU 35.71 GB Commit Limit + 15s TDR (100% Integrity Safe)
+1. **Hexagon NPU V81 SMMU 32 GB Allocation Unlock (`qcnspmcdm8480.sys`)**
+   * **Registry Key**: `HKLM\SYSTEM\CurrentControlSet\Enum\ACPI\VEN_QCOM&DEV_0FF0...\Device Parameters\NSPM\SMMU`
+   * **Value**: `FastRPCSIDAllocation` (`REG_BINARY`, 32 bytes)
+   * **Mechanism**: Disassembly of `qcnspmcdm8480.sys` (`0x14003ee30`–`0x14003ef38`) reveals that the driver parses byte slices `[12..15]`, `[20..23]`, and `[28..31]` as **Big-Endian 32-bit integers (`bfi` assembly sequence) shifted left by 20 bits (`lsl #20`, MB to Bytes)**.
+   * **Change**: Modifies the three SID group maximum allocation fields from `00 00 40 00` (`0x00004000` MB = **16 GB**) to `00 00 80 00` (`0x00008000` MB = **32 GB**) at byte indices `14`, `22`, and `30`.
+2. **Adreno X2-90 (`Adreno 880`) Shared Memory Commit Limit Expansion (`qcdxkm8480.sys`)**
+   * **Registry Key**: `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MemoryManager`
+   * **Value**: `SystemPartitionCommitLimitPercentage = 75` (`REG_DWORD`)
+   * **Mechanism**: Disassembly of `qcdxkm8480.sys` (`0x140631b4c`–`0x140631ca8`) proves that `SystemMemoryCommitLimit` suffers from a 32-bit shift bug (`lsl w26, w8, #20`), overflowing at 4 GB. In contrast, `SystemPartitionCommitLimitPercentage` (`1..100`) uses **64-bit arithmetic (`(TotalRAM - 512MB) / 100 * Pct`)** to store the driver's internal partition commit limit at `[x19, #0x588]`.
+   * **Change**: Raises WDDM shared GPU memory ceiling from the default 50% (`23.81 GB`) to **75% (`35.71 GB`)**.
+3. **WDDM GPU TDR Timeout Extension (`dxgkrnl.sys`)**
+   * **Registry Key**: `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`
+   * **Values**: `TdrDelay = 15`, `TdrDdiDelay = 15` (`REG_DWORD`, default 2s → **15s**)
+   * **Benefit**: Prevents Windows from resetting the Adreno driver during heavy LLM prefill passes or long compute shaders.
 
-### Stage 2: LPDDR5x 메모리 버스 반응성 & 팬 프로파일 최적화
-1. **Qualcomm PEP (`qcpep_8480`) DDR 고성능 모드 진입 임계값 완화**
-   * 경로: `HKLM\SYSTEM\CurrentControlSet\Services\qcpep_8480\Parameters`
-   * 값: `SelectivelyEnableDdrPerfMode = 1`, `DDRPerfModeCpuFreqThresholdMhz = 1800` (기본 `2600 MHz` → **`1800 MHz`**)
-2. **ASUS Optimization 팬 프로파일 고정**
-   * `QuietFan = 2`, `QuietFanDC = 2` (Performance 모드)
+### Stage 2: LPDDR5x Memory Bus Responsiveness & Thermal Profile
+1. **Qualcomm Power Engine Plug-in (`qcpep_8480`) DDR Performance Mode Scaling**
+   * **Registry Key**: `HKLM\SYSTEM\CurrentControlSet\Services\qcpep_8480\Parameters`
+   * **Values**: `SelectivelyEnableDdrPerfMode = 1`, `DDRPerfModeCpuFreqThresholdMhz = 1800` (default `2600 MHz` → **`1800 MHz`**)
+   * **Benefit**: Triggers full 12-channel LPDDR5x high-performance bus bandwidth mode as soon as CPU clocks cross 1.8 GHz instead of waiting for 2.6 GHz.
+2. **ASUS Optimization Fan Profile**
+   * Sets `QuietFan = 2` and `QuietFanDC = 2` (Performance profile).
 
-### Stage 3: 가상 전용 VRAM 보고 & HVCI Stage-2 변환 오버헤드 해제
-1. **전용 VRAM 보고값 추가 (`Display Class 0000`)**
-   * `HardwareInformation.qwMemorySize = 4294967296` (4GB), `DedicatedSegmentSize = 2048` (2GB)
-2. **HVCI (코어 격리 - 메모리 무결성) 비활성화**
-   * `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled = 0`
-   * Hypervisor Stage-2 커널 코드 페이지 검증 오버헤드 제거 (원치 않을 경우 Stage 2까지만 적용 가능: `.\scripts\apply_tuning.ps1 -MaxStage 2`).
-3. **Snapdragon ARM64 DPAPI 보호 안전장치**
-   * `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power\HiberbootEnabled = 0` 강제 유지 (빠른 시작으로 인한 TPM/DPAPI MasterKey 유실 방지).
+### Stage 3: Dedicated VRAM Reporting & HVCI Stage-2 MMU Overhead Removal
+1. **Dedicated VRAM Reporting (`Display Class 0000`)**
+   * Sets `HardwareInformation.qwMemorySize = 4294967296` (4 GB) and `DedicatedSegmentSize = 2048` (2 GB) for legacy games and creative apps that fail when `AdapterRAM = 0`.
+2. **HVCI (Core Isolation — Memory Integrity) Disable**
+   * Sets `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity\Enabled = 0` to eliminate Hypervisor Stage-2 kernel code page table verification overhead.
+   * *(Optional: If you prefer to keep Windows Security Memory Integrity enabled, apply up to Stage 2 via `-MaxStage 2`.)*
+3. **Snapdragon ARM64 DPAPI Safety Guard**
+   * Explicitly enforces `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power\HiberbootEnabled = 0` to prevent the Snapdragon ARM64 Fast Startup TPM/DPAPI MasterKey desynchronization bug.
 
 ---
 
-## 3. 재부팅 후 실측 검증 및 벤치마크 결과
+## 3. Post-Reboot Live Verification & Benchmark Results
 
-[`benchmarks/verify_and_benchmark.py`](benchmarks/verify_and_benchmark.py)를 통해 재부팅 후 실제 하드웨어에서 측정한 결과입니다:
+Measured on **ASUS Zenbook A16 (`UX3607OA`, `X2E-94-100`, 48 GB RAM)** using [`benchmarks/verify_and_benchmark.py`](benchmarks/verify_and_benchmark.py):
 
-| 테스트 항목 | 튜닝 전 (Factory Default) | **튜닝 후 실측 (Unlocked)** | 검증 방법 |
+| Benchmark / Verification Metric | Factory Default (Before) | **Unlocked (After Reboot)** | Verification API / Method |
 | :--- | :--- | :--- | :--- |
-| **WDDM GPU 공유 메모리 (`SharedSystemMemory`)** | `23.81 GB` (50%) | **`35.71 GB` (`38,345,327,616 B`)** | `dxgi.dll` (`IDXGIAdapter1::GetDesc1`) |
-| **Adreno X2-90 실제 D3D12 버퍼 할당** | 23.8GB 초과 시 `E_OUTOFMEMORY` | **`30.0 GB` 연속 할당 및 해제 성공** | `d3d12.dll` (`CreateCommittedResource`) |
-| **Hexagon NPU V81 FastRPC SMMU 매핑** | `16.0 GB`에서 매핑 차단 | **`22.0 GB` 연속 DMA 매핑 성공** | `libcdsprpc.dll` (`rpcmem_alloc2` + `rpcmem_to_fd`) |
-| **Hexagon NPU V81 D3D12 MCDM 할당** | `16.0 GB` 제한 | **`28.0 GB` 연속 할당 성공** | `dxcore.dll` + `d3d12.dll` (`MCDM Core Compute`) |
-| **Adreno X2-90 OpenCL 3.0 메모리 대역폭** | — | **`157.57 GB/s`** (`10 GB in 63.47 ms`) | `OpenCL.dll` (`float4` STREAM Copy Kernel) |
-| **Adreno X2-90 지속 연산 성능 (Sustained)** | — | **`6.60 TFLOPS` (FP32) / `9.17 TFLOPS` (FP16)** | `OpenCL.dll` (8-way unrolled FMA Kernel) |
+| **WDDM Shared GPU Memory (`SharedSystemMemory`)** | `23.81 GB` (50%) | **`35.71 GB` (`38,345,327,616 B`)** | `dxgi.dll` (`IDXGIAdapter1::GetDesc1`) |
+| **Adreno X2-90 Real D3D12 Buffer Allocation** | `E_OUTOFMEMORY` above 23.8 GB | **`30.0 GB` allocated & freed cleanly** | `d3d12.dll` (`CreateCommittedResource` on `DEFAULT` heap) |
+| **Hexagon NPU V81 FastRPC SMMU Mapping** | Hard-capped at `16.0 GB` | **`22.0 GB` DMA-mapped cleanly** | `libcdsprpc.dll` (`rpcmem_alloc2` + `rpcmem_to_fd`) |
+| **Hexagon NPU V81 D3D12 MCDM Allocation** | Capped at `16.0 GB` | **`28.0 GB` allocated cleanly** | `dxcore.dll` + `d3d12.dll` (`MCDM Core Compute`) |
+| **Adreno X2-90 OpenCL 3.0 Memory Bandwidth** | — | **`157.57 GB/s`** (`10 GB in 63.47 ms`) | `OpenCL.dll` (`float4` STREAM Copy Kernel) |
+| **Adreno X2-90 Sustained Compute Throughput** | — | **`6.60 TFLOPS` (FP32) / `9.17 TFLOPS` (FP16)** | `OpenCL.dll` (8-way unrolled FMA Kernel) |
 
 ---
 
-## 4. 사용 방법 (Quick Start)
+## 4. Quick Start
 
-### 전체 튜닝 적용 (Stage 1 ~ 3)
-`apply-tuning.cmd`를 우클릭하여 **관리자 권한으로 실행**하거나, 관리자 PowerShell에서 아래 명령어를 실행한 뒤 **재부팅**합니다:
+### Apply Unlock (Stages 1–3)
+Right-click `apply-tuning.cmd` and select **Run as administrator**, or run from an elevated PowerShell prompt and **reboot**:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apply_tuning.ps1
 ```
 
-> **팁 (윈도우 보안 '메모리 무결성' 기능을 유지하고 싶다면):**
-> Stage 3에는 HVCI(코어 격리 메모리 무결성) 비활성화가 포함되어 있어 재부팅 후 Windows 보안에서 *"메모리 무결성이 꺼져 있음"* 알림이 뜰 수 있습니다. 만약 메모리 무결성(HVCI)을 켠 채로 NPU 32GB + GPU 35.7GB + DDR 버스 부스트만 적용하고 싶다면 `-MaxStage 2` 옵션을 사용하세요:
+> **Note on Windows Security "Memory Integrity" (HVCI):**
+> Stage 3 disables HVCI (`HypervisorEnforcedCodeIntegrity\Enabled = 0`) to remove Stage-2 MMU page table walk overhead, which causes Windows Security to display a *"Memory integrity is off"* notice after reboot.
+> Because the **32 GB NPU unlock and 35.71 GB GPU unlock (Stage 1) and LPDDR5x bus scaling (Stage 2) work 100% identically with HVCI enabled**, you can keep Memory Integrity turned ON by running with `-MaxStage 2`:
 > ```powershell
 > powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\apply_tuning.ps1 -MaxStage 2
 > ```
+> Or re-enable Memory Integrity anytime while keeping all other unlocks active:
+> ```powershell
+> Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" -Name "Enabled" -Value 1 -Type DWord
+> ```
 
-### 실측 벤치마크 및 검증 실행 (재부팅 후)
-`run-benchmarks.cmd`를 실행하거나 터미널에서 아래 명령어를 실행합니다:
+### Run Post-Reboot Verification & Benchmarks
+Double-click `run-benchmarks.cmd` or run:
 
 ```powershell
 python .\benchmarks\verify_and_benchmark.py
 ```
 
-### 공장 초기화 (전체 원복)
-언제든 `restore-defaults.cmd`를 실행하거나 관리자 PowerShell에서 아래 명령어를 실행한 뒤 재부팅하면 모든 설정이 출고 초기값으로 복원됩니다:
+### Restore Factory Defaults
+Right-click `restore-defaults.cmd` and select **Run as administrator**, or run from an elevated PowerShell prompt and reboot:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore_defaults.ps1
@@ -102,13 +108,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restore_defaults.p
 
 ---
 
-## 5. 디렉터리 구조
+## 5. Repository Structure
 
-* [`apply-tuning.cmd`](apply-tuning.cmd) — 관리자 권한 자동 승격 및 튜닝 적용 배치 파일
-* [`restore-defaults.cmd`](restore-defaults.cmd) — 공장 초기값 원복 배치 파일
-* [`run-benchmarks.cmd`](run-benchmarks.cmd) — 재부팅 후 GPU/NPU 메모리 할당 및 대역폭 벤치마크 실행 파일
-* [`scripts/apply_tuning.ps1`](scripts/apply_tuning.ps1) — 하드웨어 가드 및 자동 백업이 포함된 Stage 1~3 커널 튜닝 스크립트
-* [`scripts/restore_defaults.ps1`](scripts/restore_defaults.ps1) — 초기 레지스트리 복원 스크립트
-* [`benchmarks/verify_and_benchmark.py`](benchmarks/verify_and_benchmark.py) — DXGI, D3D12(GPU 30GB), FastRPC/MCDM(NPU 22~28GB), OpenCL 3.0 벤치마크 스위트
-* [`tools/inspect_drivers.py`](tools/inspect_drivers.py) — 커널 드라이버(`qcdxkm8480.sys`, `qcnspmcdm8480.sys`, `qcpep8480.sys`) 오프셋 검증 스크립트
-* [`docs/KERNEL_ANALYSIS.md`](docs/KERNEL_ANALYSIS.md) — ARM64 커널 드라이버 역어셈블리 상세 기술 분석 문서
+* [`apply-tuning.cmd`](apply-tuning.cmd) — UAC self-elevating batch launcher for applying the kernel unlock
+* [`restore-defaults.cmd`](restore-defaults.cmd) — UAC self-elevating batch launcher for restoring factory defaults
+* [`run-benchmarks.cmd`](run-benchmarks.cmd) — Batch launcher for the post-reboot verification & benchmark suite
+* [`scripts/apply_tuning.ps1`](scripts/apply_tuning.ps1) — Stage 1–3 kernel tuning PowerShell script with hardware model guard and automatic JSON backup
+* [`scripts/restore_defaults.ps1`](scripts/restore_defaults.ps1) — Factory default restoration PowerShell script
+* [`benchmarks/verify_and_benchmark.py`](benchmarks/verify_and_benchmark.py) — Live DXGI, D3D12 (30 GB GPU), FastRPC/MCDM (22–28 GB NPU), and OpenCL 3.0 bandwidth/TFLOPS benchmark suite
+* [`tools/inspect_drivers.py`](tools/inspect_drivers.py) — Read-only PE binary inspector for locating registry parameter VAs and file offsets in Qualcomm drivers
+* [`docs/KERNEL_ANALYSIS.md`](docs/KERNEL_ANALYSIS.md) — Detailed ARM64 disassembly and reverse-engineering writeup
